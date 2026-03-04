@@ -1,0 +1,9 @@
+(executable
+ (name main)
+ (preprocess
+  (pps ppx_deriving.show)))
+
+(env
+ (dev
+  (flags
+   (:standard -warn-error -26-27-32-34-37-39))))
