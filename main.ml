@@ -135,12 +135,14 @@ end
 
 module Ast = struct
   type expr =
-    | Lit of int
+    | Lit of lit
     | Var of string
     | Bin of (expr * Token.t * expr)
     | Abs of (string * expr)
     | App of (expr * expr)
   [@@deriving show { with_path = false }]
+
+  and lit = Int of int | Unit [@@deriving show { with_path = false }]
 
   let show_expr_list = [%show: expr list]
 end
@@ -185,8 +187,10 @@ end = struct
     | Some token -> parser.current <- token
     | None -> parser.current <- Token.Eof
 
-  let consume parser x reason =
-    if parser.current = x then advance parser else error reason
+  let matches parser = List.find (( = ) parser.current)
+
+  let consume parser token reason =
+    if parser.current = token then advance parser else error reason
 
   let consume_ident parser reason =
     match parser.current with
@@ -275,11 +279,15 @@ end = struct
     advance parser;
     match parser.previous with
     | Token.Id name -> Ast.Var name
-    | Token.Num x -> Ast.Lit (int_of_string x)
+    | Token.Num x -> Ast.Lit (Int (int_of_string x))
     | Token.LParen ->
-        let expr = parse_expr parser in
-        consume parser Token.RParen "expected ')' after grouping";
-        expr
+        if parser.current = Token.RParen then (
+          advance parser;
+          Ast.Lit Unit)
+        else
+          let expr = parse_expr parser in
+          consume parser Token.RParen "expected ')' after grouping";
+          expr
     | Token.Lam -> parse_abs parser
     | _ -> error "expected expression"
 
@@ -298,41 +306,6 @@ end = struct
     loop input
 end
 
-module Redex = struct
-  open Ast
-
-  exception Exn of string
-
-  let error reason = raise (Exn reason)
-  let as_int = function Lit x -> x | _ -> error "expected int"
-
-  let rec subst (src : string) (dst : expr) (expr : expr) =
-    let subst' = subst src dst in
-    match expr with
-    | Lit _ -> expr
-    | Var name -> if src = name then dst else expr
-    | Bin (lhs, op, rhs) -> Bin (subst' lhs, op, subst' rhs)
-    | Abs (param, body) -> if src = param then expr else Abs (param, subst' body)
-    | App (lhs, rhs) -> App (subst' lhs, subst' rhs)
-
-  let rec reduce = function
-    | (Lit _ | Var _ | Abs _) as expr -> expr
-    | Bin (lhs, op, rhs) ->
-        let lhs = reduce lhs |> as_int in
-        let rhs = reduce rhs |> as_int in
-        Lit
-          (match op with
-          | Token.Plus -> lhs + rhs
-          | Token.Minus -> lhs - rhs
-          | Token.Star -> lhs * rhs
-          | Token.Slash -> lhs / rhs
-          | _ -> error ("unkown op " ^ Token.show op))
-    | App (lhs, rhs) -> (
-        match reduce lhs with
-        | Abs (param, body) -> subst param rhs body |> reduce
-        | _ -> error "expected abs")
-end
-
 module Runtime = struct
   exception Exn of string
 
@@ -342,14 +315,23 @@ module Runtime = struct
 
   module Value = struct
     type t =
+      | Unit
       | Int of int
       | Fun of (string * Ast.expr * t Env.t)
       | Native of (string * (t -> t))
 
     let rec show = function
+      | Unit -> "()"
       | Int x -> string_of_int x
       | Fun _ -> "<fn>"
       | Native (name, _) -> format "<native fn '%s'>" name
+
+    let rec show_with_type v =
+      match v with
+      | Unit -> format "unit = %s" (show v)
+      | Int _ -> format "int = %s" (show v)
+      | Fun (input, _, _) -> format "%s -> ? = %s" input (show v)
+      | Native (_, _) -> format "? -> ? = %s" (show v)
 
     let as_fun = function Fun (_ as f) -> f | _ -> error "expected fun"
   end
@@ -358,7 +340,8 @@ module Runtime = struct
   open Value
 
   let rec eval' env = function
-    | Lit x -> Int x
+    | Lit Unit -> Unit
+    | Lit (Int x) -> Int x
     | Var name ->
         Env.find_opt name env
         |> Option.get_or_else (fun _ -> error (format "unbound var %s" name))
@@ -378,7 +361,7 @@ module Runtime = struct
     let lhs, rhs =
       match (eval' env lhs, eval' env rhs) with
       | Int x, Int y -> (x, y)
-      | _ -> error "can only add integers"
+      | _ -> error "operands must be numbers"
     in
     let res =
       match op with
@@ -396,7 +379,7 @@ module Runtime = struct
     Env.empty
     |> add_native "echo" @@ fun v ->
        Value.show v |> print_endline;
-       Int 0
+       Unit
 
   let eval = eval' (init_env ())
 end
@@ -408,14 +391,14 @@ let interpret source =
   | Parser.Exn reason -> Error (Parse_error reason)
   | Runtime.Exn reason -> Error (Runtime_error reason)
 
-let rec repl () =
+let rec run_repl () =
   try
     (match read_line () |> interpret with
-    | Ok (Some expr) -> Runtime.Value.show expr |> print_endline
+    | Ok (Some value) -> Runtime.Value.show_with_type value |> println "- : %s"
     | Error (Parse_error reason) -> eprintln "parse error: %s" reason
     | Error (Runtime_error reason) -> eprintln "runtime error: %s" reason
     | _ -> ());
-    repl ()
+    run_repl ()
   with End_of_file -> ()
 
 let read_file_to_string path =
@@ -430,9 +413,13 @@ let run_file path =
        exit 1
   in
   match interpret source with
-  | Ok (Some expr) -> Runtime.Value.show expr |> print_endline
+  | Ok (Some value) -> Runtime.Value.show value |> print_endline
   | Error (Parse_error reason) -> eprintln "parse error: %s" reason
   | Error (Runtime_error reason) -> eprintln "runtime error: %s" reason
   | _ -> ()
 
-let () = repl ()
+let () =
+  match Array.length Sys.argv with
+  | 1 -> run_repl ()
+  | 2 -> run_file Sys.argv.(1)
+  | _ -> eprintln "usage: %s [path]" Sys.argv.(0)
