@@ -59,6 +59,11 @@ module Token = struct
     (* keywords *)
     | True
     | False
+    | And
+    | Or
+    | If
+    | Then
+    | Else
     | Let
     | In
   [@@deriving show { with_path = false }]
@@ -66,6 +71,11 @@ module Token = struct
   let lookup_ident = function
     | "true" -> True
     | "false" -> False
+    | "and" -> And
+    | "or" -> Or
+    | "if" -> If
+    | "then" -> Then
+    | "else" -> Else
     | "let" -> Let
     | "in" -> In
     | x -> Id x
@@ -154,9 +164,11 @@ module Ast = struct
     | Abs of (string * expr)
     | App of (expr * expr)
     | Bind of (string * expr * expr)
+    | Cond of (expr * expr * expr)
   [@@deriving show { with_path = false }]
 
-  and lit = Int of int | Unit [@@deriving show { with_path = false }]
+  and lit = Unit | Int of int | Bool of bool
+  [@@deriving show { with_path = false }]
 
   let show_expr_list = [%show: expr list]
 end
@@ -172,14 +184,16 @@ end = struct
   (*
     expr   := or ;
     or     := and ('or' and)* ;
-    and    := cond ('and' cond)* ;
+    and    := eq ('and' eq)* ;
     eq     := cmp (('==' | '!=') cmp)* ;
     cmp    := term (('>' | '>=' | '<' | '<=') term)* ;
     term   := factor (('+' | '-') factor)* ;
     factor := app (('*' | '/') app)* ;
     app    := atom atom* ;
-    atom   := ID | LIT | '(' expr ')' | abs ;
+    atom   := ID | LIT | '(' expr ')' | abs | cond | bind ;
     abs    := '\' ID '.' expr ;
+    cond   := 'if' expr 'then' expr else 'expr' ;
+    bind   := 'let' ID 'in' expr ;
   *)
 
   type t = {
@@ -222,7 +236,36 @@ end = struct
     advance parser;
     parser.current <> Token.Eof |> Bool.then_some (fun _ -> parse_expr parser)
 
-  and parse_expr parser = parse_eq parser
+  (* expr := or ; *)
+  and parse_expr parser = parse_or parser
+
+  (* or := and ('or' and)* ; *)
+  and parse_or parser =
+    let expr = parse_and parser in
+    let rec loop expr =
+      match parser.current with
+      | Token.Or ->
+          advance parser;
+          let op = parser.previous in
+          let rhs = parse_and parser in
+          loop (Ast.Bin (expr, op, rhs))
+      | _ -> expr
+    in
+    loop expr
+
+  (* and := eq ('and' eq)* ; *)
+  and parse_and parser =
+    let expr = parse_eq parser in
+    let rec loop expr =
+      match parser.current with
+      | Token.And ->
+          advance parser;
+          let op = parser.previous in
+          let rhs = parse_eq parser in
+          loop (Ast.Bin (expr, op, rhs))
+      | _ -> expr
+    in
+    loop expr
 
   (** eq := cmp (('==' | '!=') cmp)* ; *)
   and parse_eq parser =
@@ -298,6 +341,8 @@ end = struct
     match parser.previous with
     | Token.Id name -> Ast.Var name
     | Token.Num x -> Ast.Lit (Int (int_of_string x))
+    | Token.True -> Ast.Lit (Bool true)
+    | Token.False -> Ast.Lit (Bool false)
     | Token.LParen ->
         if matches parser [ Token.RParen ] then Ast.Lit Unit
         else
@@ -305,7 +350,8 @@ end = struct
           consume parser Token.RParen "expected ')' after grouping";
           expr
     | Token.Lam -> parse_abs parser
-    | Token.Let -> parse_let parser
+    | Token.Let -> parse_bind parser
+    | Token.If -> parse_cond parser
     | _ -> error "expected expression"
 
   (** abs := '\' ID '.' expr ; *)
@@ -323,13 +369,22 @@ end = struct
     loop input
 
   (** bind := 'let' ID '=' expr 'in' expr *)
-  and parse_let parser =
+  and parse_bind parser =
     let name = consume_ident parser "expected ident after 'let'" in
     consume parser Token.Eq "expected '=' after let name";
     let init = parse_expr parser in
     consume parser Token.In "expected 'in' after let initializer";
     let expr = parse_expr parser in
     Ast.Bind (name, init, expr)
+
+  (* cond := 'if' expr 'then' expr else 'expr' ; *)
+  and parse_cond parser =
+    let cond = parse_expr parser in
+    consume parser Token.Then "expected 'then' after  condition";
+    let then_branch = parse_expr parser in
+    consume parser Token.Else "expected 'else' after 'then' expression";
+    let else_branch = parse_expr parser in
+    Ast.Cond (cond, then_branch, else_branch)
 end
 
 module Runtime = struct
@@ -343,12 +398,14 @@ module Runtime = struct
     type t =
       | Unit
       | Int of int
+      | Bool of bool
       | Fun of (string * Ast.expr * t Env.t)
       | Native of (string * (t -> t))
 
     let rec show = function
       | Unit -> "()"
-      | Int x -> string_of_int x
+      | Int n -> string_of_int n
+      | Bool b -> string_of_bool b
       | Fun _ -> "<fn>"
       | Native (name, _) -> format "<native fn '%s'>" name
 
@@ -356,6 +413,7 @@ module Runtime = struct
       match v with
       | Unit -> format "unit = %s" (show v)
       | Int _ -> format "int = %s" (show v)
+      | Bool _ -> format "bool = %s" (show v)
       | Fun (input, _, _) -> format "%s -> ? = %s" input (show v)
       | Native (_, _) -> format "? -> ? = %s" (show v)
   end
@@ -363,9 +421,20 @@ module Runtime = struct
   open Ast
   open Value
 
+  let bin_cmp lhs op rhs =
+    match (lhs, rhs) with
+    | Int l, Int r -> Bool (op l r)
+    | _ -> error "operands must be numbers"
+
+  let bin_ari lhs op rhs =
+    match (lhs, rhs) with
+    | Int l, Int r -> Int (op l r)
+    | _ -> error "operands must be numbers"
+
   let rec eval' env = function
     | Lit Unit -> Unit
-    | Lit (Int x) -> Int x
+    | Lit (Int n) -> Int n
+    | Lit (Bool b) -> Bool b
     | Var name ->
         Env.find_opt name env
         |> Option.get_or_else (fun _ -> error (format "unbound var %s" name))
@@ -373,6 +442,7 @@ module Runtime = struct
     | App (_ as app) -> eval_app env app
     | Bin (_ as bin) -> eval_bin env bin
     | Bind (_ as bind) -> eval_bind env bind
+    | Cond (_ as cond) -> eval_cond env cond
 
   and eval_app env (lhs, rhs) =
     let lhs = eval' env lhs in
@@ -383,25 +453,28 @@ module Runtime = struct
     | _ -> error "only functions are callable"
 
   and eval_bin env (lhs, op, rhs) =
-    match (eval' env lhs, eval' env rhs) with
-    | Int l, Int r -> (
-        match op with
-        | Token.EqEq -> Int (if l = r then 1 else 0)
-        | Token.BangEq -> Int (if l <> r then 1 else 0)
-        | Token.Gt -> Int (if l > r then 1 else 0)
-        | Token.GtEq -> Int (if l >= r then 1 else 0)
-        | Token.Lt -> Int (if l < r then 1 else 0)
-        | Token.LtEq -> Int (if l <= r then 1 else 0)
-        | Token.Plus -> Int (l + r)
-        | Token.Minus -> Int (l - r)
-        | Token.Star -> Int (l * r)
-        | Token.Slash -> Int (l / r)
-        | _ -> assert false)
-    | _ -> error "operands must be numbers"
+    let l, r = (eval' env lhs, eval' env rhs) in
+    match op with
+    | Token.EqEq -> Bool (l = r)
+    | Token.BangEq -> Bool (l <> r)
+    | Token.Gt -> bin_cmp l ( > ) r
+    | Token.GtEq -> bin_cmp l ( >= ) r
+    | Token.Lt -> bin_cmp l ( < ) r
+    | Token.LtEq -> bin_cmp l ( <= ) r
+    | Token.Plus -> bin_ari l ( + ) r
+    | Token.Minus -> bin_ari l ( - ) r
+    | Token.Star -> bin_ari l ( * ) r
+    | Token.Slash -> bin_ari l ( / ) r
+    | _ -> assert false
 
   and eval_bind env (name, init, expr) =
     let init = eval' env init in
     eval' (Env.add name init env) expr
+
+  and eval_cond env (cond, then_branch, else_branch) =
+    match eval' env cond with
+    | Bool b -> if b then eval' env then_branch else eval' env else_branch
+    | _ -> error "only booleans are allowed in conditions"
 
   let add_native name f = Env.add name (Native (name, f))
 
