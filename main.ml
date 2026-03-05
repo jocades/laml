@@ -187,7 +187,11 @@ end = struct
     | Some token -> parser.current <- token
     | None -> parser.current <- Token.Eof
 
-  let matches parser = List.find (( = ) parser.current)
+  let matches parser tokens =
+    if List.find_opt (( = ) parser.current) tokens |> Option.is_some then (
+      advance parser;
+      true)
+    else false
 
   let consume parser token reason =
     if parser.current = token then advance parser else error reason
@@ -281,9 +285,7 @@ end = struct
     | Token.Id name -> Ast.Var name
     | Token.Num x -> Ast.Lit (Int (int_of_string x))
     | Token.LParen ->
-        if parser.current = Token.RParen then (
-          advance parser;
-          Ast.Lit Unit)
+        if matches parser [ Token.RParen ] then Ast.Lit Unit
         else
           let expr = parse_expr parser in
           consume parser Token.RParen "expected ')' after grouping";
@@ -358,20 +360,21 @@ module Runtime = struct
     | _ -> error "only functions are callable"
 
   and eval_bin env (lhs, op, rhs) =
-    let lhs, rhs =
-      match (eval' env lhs, eval' env rhs) with
-      | Int x, Int y -> (x, y)
-      | _ -> error "operands must be numbers"
-    in
-    let res =
-      match op with
-      | Token.Plus -> lhs + rhs
-      | Token.Minus -> lhs - rhs
-      | Token.Star -> lhs * rhs
-      | Token.Slash -> lhs / rhs
-      | _ -> assert false
-    in
-    Int res
+    match (eval' env lhs, eval' env rhs) with
+    | Int l, Int r -> (
+        match op with
+        | Token.EqEq -> Int (if l = r then 1 else 0)
+        | Token.BangEq -> Int (if l <> r then 1 else 0)
+        | Token.Gt -> Int (if l > r then 1 else 0)
+        | Token.GtEq -> Int (if l >= r then 1 else 0)
+        | Token.Lt -> Int (if l < r then 1 else 0)
+        | Token.LtEq -> Int (if l <= r then 1 else 0)
+        | Token.Plus -> Int (l + r)
+        | Token.Minus -> Int (l - r)
+        | Token.Star -> Int (l * r)
+        | Token.Slash -> Int (l / r)
+        | _ -> assert false)
+    | _ -> error "operands must be numbers"
 
   let add_native name f = Env.add name (Native (name, f))
 
