@@ -56,7 +56,19 @@ module Token = struct
     | GtEq
     | Lt
     | LtEq
+    (* keywords *)
+    | True
+    | False
+    | Let
+    | In
   [@@deriving show { with_path = false }]
+
+  let lookup_ident = function
+    | "true" -> True
+    | "false" -> False
+    | "let" -> Let
+    | "in" -> In
+    | x -> Id x
 end
 
 module Lexer : sig
@@ -116,7 +128,8 @@ end = struct
        | c when c = '_' || Char.is_alpha c ->
            let start = lexer.cursor - 1 in
            seek lexer (fun c -> c = '_' || Char.is_alnum c);
-           Id (String.sub lexer.source start (lexer.cursor - start))
+           String.sub lexer.source start (lexer.cursor - start)
+           |> Token.lookup_ident
        | c when Char.is_digit c ->
            let start = lexer.cursor - 1 in
            seek lexer Char.is_digit;
@@ -140,6 +153,7 @@ module Ast = struct
     | Bin of (expr * Token.t * expr)
     | Abs of (string * expr)
     | App of (expr * expr)
+    | Bind of (string * expr * expr)
   [@@deriving show { with_path = false }]
 
   and lit = Int of int | Unit [@@deriving show { with_path = false }]
@@ -291,6 +305,7 @@ end = struct
           consume parser Token.RParen "expected ')' after grouping";
           expr
     | Token.Lam -> parse_abs parser
+    | Token.Let -> parse_let parser
     | _ -> error "expected expression"
 
   (** abs := '\' ID '.' expr ; *)
@@ -306,6 +321,15 @@ end = struct
       | _ -> error "expected '.' or ident"
     in
     loop input
+
+  (** bind := 'let' ID '=' expr 'in' expr *)
+  and parse_let parser =
+    let name = consume_ident parser "expected ident after 'let'" in
+    consume parser Token.Eq "expected '=' after let name";
+    let init = parse_expr parser in
+    consume parser Token.In "expected 'in' after let initializer";
+    let expr = parse_expr parser in
+    Ast.Bind (name, init, expr)
 end
 
 module Runtime = struct
@@ -334,8 +358,6 @@ module Runtime = struct
       | Int _ -> format "int = %s" (show v)
       | Fun (input, _, _) -> format "%s -> ? = %s" input (show v)
       | Native (_, _) -> format "? -> ? = %s" (show v)
-
-    let as_fun = function Fun (_ as f) -> f | _ -> error "expected fun"
   end
 
   open Ast
@@ -350,6 +372,7 @@ module Runtime = struct
     | Abs (input, expr) -> Fun (input, expr, env)
     | App (_ as app) -> eval_app env app
     | Bin (_ as bin) -> eval_bin env bin
+    | Bind (_ as bind) -> eval_bind env bind
 
   and eval_app env (lhs, rhs) =
     let lhs = eval' env lhs in
@@ -375,6 +398,10 @@ module Runtime = struct
         | Token.Slash -> Int (l / r)
         | _ -> assert false)
     | _ -> error "operands must be numbers"
+
+  and eval_bind env (name, init, expr) =
+    let init = eval' env init in
+    eval' (Env.add name init env) expr
 
   let add_native name f = Env.add name (Native (name, f))
 
