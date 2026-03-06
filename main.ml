@@ -194,7 +194,7 @@ end = struct
     abs     := '\' ID+ '.' expr ;
     primary := atom | cond | bind ;
     cond    := 'if' expr 'then' expr 'else' expr ;
-    bind    := 'let' ID '=' expr 'in' expr ;
+    bind    := 'let' ID+ '=' expr 'in' expr ;
   *)
 
   type t = {
