@@ -41,6 +41,7 @@ module Token = struct
     (* delims *)
     | Lam
     | Dot
+    | Comma
     | LParen
     | RParen
     (* operators *)
@@ -56,6 +57,8 @@ module Token = struct
     | GtEq
     | Lt
     | LtEq
+    | Arrow
+    | Pipe
     (* keywords *)
     | True
     | False
@@ -67,6 +70,8 @@ module Token = struct
     | Let
     | Rec
     | In
+    | Match
+    | With
   [@@deriving show { with_path = false }]
 
   let lookup_ident = function
@@ -80,6 +85,8 @@ module Token = struct
     | "let" -> Let
     | "rec" -> Rec
     | "in" -> In
+    | "match" -> Match
+    | "with" -> With
     | x -> Id x
 end
 
@@ -125,17 +132,19 @@ end = struct
        (* delims *)
        | '\\' -> Lam
        | '.' -> Dot
+       | ',' -> Comma
        | '(' -> LParen
        | ')' -> RParen
        (* operators *)
        | '+' -> Plus
-       | '-' -> Minus
+       | '-' -> if matches lexer '>' then Arrow else Minus
        | '*' -> Star
        | '/' -> Slash
        | '=' -> if matches lexer '=' then EqEq else Eq
        | '!' -> if matches lexer '=' then BangEq else Bang
        | '>' -> if matches lexer '=' then GtEq else Gt
        | '<' -> if matches lexer '=' then LtEq else Lt
+       | '|' -> Pipe
        (* items *)
        | c when c = '_' || Char.is_alpha c ->
            let start = lexer.cursor - 1 in
@@ -159,6 +168,12 @@ end = struct
 end
 
 module Ast = struct
+  type lit = Unit | Int of int | Bool of bool
+  [@@deriving show { with_path = false }]
+
+  type pattern = Wildcard | Var of string | Lit of lit
+  [@@deriving show { with_path = false }]
+
   type expr =
     | Lit of lit
     | Var of string
@@ -167,9 +182,7 @@ module Ast = struct
     | App of (expr * expr)
     | Bind of (bool * string * expr * expr)
     | Cond of (expr * expr * expr)
-  [@@deriving show { with_path = false }]
-
-  and lit = Unit | Int of int | Bool of bool
+    | Match of (expr * (pattern * expr) list)
   [@@deriving show { with_path = false }]
 
   let show_expr_list = [%show: expr list]
@@ -356,6 +369,7 @@ end = struct
     | Token.Lam -> parse_abs parser
     | Token.Let -> parse_bind parser
     | Token.If -> parse_cond parser
+    | Token.Match -> parse_match parser
     | _ -> error "expected expression"
 
   (** abs := '\' ID+ '.' expr ; *)
@@ -404,6 +418,78 @@ end = struct
     consume parser Token.Else "expected 'else' after 'then' expression";
     let else_branch = parse_expr parser in
     Ast.Cond (cond, then_branch, else_branch)
+
+  (* match := 'match' expr 'with' '|'? case ('|' case)* ; *)
+  and parse_match parser =
+    let scrutinee = parse_expr parser in
+    consume parser Token.With "expected 'with' after match scrutinee";
+    if parser.current = Token.Pipe then advance parser;
+    let first = parse_case parser in
+    let rec cases acc =
+      match parser.current with
+      | Token.Pipe -> cases (parse_case parser :: acc)
+      | _ -> List.rev acc
+    in
+    Ast.Match (scrutinee, cases [ first ])
+
+  (* case := pattern '->' expr *)
+  and parse_case parser =
+    let pat = parse_pattern parser in
+    consume parser Token.Arrow "expected '->' after pattern";
+    let body = parse_expr parser in
+    (pat, body)
+
+  and parse_pattern parser =
+    advance parser;
+    match parser.previous with
+    | Token.Id name when name = "_" -> Ast.Wildcard
+    | Token.Id name -> Ast.Var name
+    | Token.Num n -> Ast.Lit (Int (int_of_string n))
+    | Token.True -> Ast.Lit (Bool true)
+    | Token.False -> Ast.Lit (Bool false)
+    | _ -> error "expected pattern"
+end
+
+module Lower = struct
+  type x = Foo
+
+  let g = function Foo -> ()
+
+  let rec lower expr = lower_match expr
+
+  and lower_match = function
+    | Ast.Match (scrutinee, cases) ->
+        let scrutinee = lower_match scrutinee in
+        lower_cases scrutinee cases
+    | Lit _ as lit -> lit
+    | Var _ as v -> v
+    | Bin (l, op, r) -> Bin (lower_match l, op, lower_match r)
+    | Abs (x, body) -> Abs (x, lower_match body)
+    | App (f, arg) -> App (lower_match f, lower_match arg)
+    | Bind (is_rec, name, init, body) ->
+        Bind (is_rec, name, lower_match init, lower_match body)
+    | Cond (c, t, e) -> Cond (lower_match c, lower_match t, lower_match e)
+
+  (*
+  let x = 0 in match x with 0 -> 100 | n -> n + 1
+
+  let x = 0 in
+    if x == 0 then 100
+    else
+      let n = x in
+        n + 1
+ *)
+  and lower_cases scrutinee = function
+    | [] -> failwith "match failure at runtime"
+    | (pat, body) :: rest -> (
+        let body = lower_match body in
+        match pat with
+        | Wildcard -> body
+        | Var name -> Bind (false, name, scrutinee, body)
+        | Lit lit_val ->
+            let cond = Ast.Bin (scrutinee, Token.EqEq, Lit lit_val) in
+            let else_branch = lower_cases scrutinee rest in
+            Cond (cond, body, else_branch))
 end
 
 module Runtime = struct
@@ -470,6 +556,7 @@ module Runtime = struct
     | Bin (_ as bin) -> eval_bin env bin
     | Bind (_ as bind) -> eval_bind env bind
     | Cond (_ as cond) -> eval_cond env cond
+    | Match _ -> assert false
 
   and eval_app env (lhs, rhs) =
     let lhs = eval' env lhs in
@@ -489,6 +576,8 @@ module Runtime = struct
         eval { "x": 2, "y": 3 } bin(x, +, y) ->
           2 + 3 (the env of the caller has never been modified)
     *)
+
+    (* apply *)
     match lhs with
     | Native f -> f rhs
     | Fun (param, body, env') -> eval' (Env.add param (ref rhs) env') body
@@ -543,7 +632,9 @@ let interpret source =
     Ok
       (Parser.parse source
       |> Option.map @@ fun expr ->
-         Ast.show_expr expr |> print_endline;
+         Ast.show_expr expr |> println "before lower: %s";
+         let expr = Lower.lower expr in
+         Ast.show_expr expr |> println "after lower: %s";
          Runtime.eval expr)
   with
   | Parser.Exn reason -> Error (Parse_error reason)
