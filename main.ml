@@ -65,6 +65,7 @@ module Token = struct
     | Then
     | Else
     | Let
+    | Rec
     | In
   [@@deriving show { with_path = false }]
 
@@ -77,6 +78,7 @@ module Token = struct
     | "then" -> Then
     | "else" -> Else
     | "let" -> Let
+    | "rec" -> Rec
     | "in" -> In
     | x -> Id x
 end
@@ -163,7 +165,7 @@ module Ast = struct
     | Bin of (expr * Token.t * expr)
     | Abs of (string * expr)
     | App of (expr * expr)
-    | Bind of (string * expr * expr)
+    | Bind of (bool * string * expr * expr)
     | Cond of (expr * expr * expr)
   [@@deriving show { with_path = false }]
 
@@ -358,40 +360,41 @@ end = struct
 
   (** abs := '\' ID+ '.' expr ; *)
   and parse_abs parser =
-    let input = consume_ident parser "expected ident after '\\'" in
+    let param = consume_ident parser "expected ident after '\\'" in
     (* nested abs syntax sugar -> \x y.x == \x.\y.x *)
-    let rec loop input =
+    let rec loop param =
       advance parser;
       match parser.previous with
-      | Token.Dot -> Ast.Abs (input, parse_expr parser)
-      | Token.Id name -> Ast.Abs (input, loop name)
+      | Token.Dot -> Ast.Abs (param, parse_expr parser)
+      | Token.Id name -> Ast.Abs (param, loop name)
       | _ -> error "expected '.' or ident"
     in
-    loop input
+    loop param
 
-  (* bind := 'let' ID+ '=' expr 'in' expr *)
+  (* bind := 'let' 'rec'? ID+ '=' expr 'in' expr *)
   and parse_bind parser =
+    let is_recursive = matches parser [ Token.Rec ] in
     let name = consume_ident parser "expected ident after 'let'" in
     (* sugar for binding abstractions:
      let f a b = a + b in <expr>
      let f = \a.\b.a + b in <expr>
      - non-abstraction bindings remain the same: let x = 1 in <expr> *)
-    let rec collect inputs =
+    let rec collect params =
       advance parser;
       match parser.previous with
-      | Token.Eq -> inputs
-      | Token.Id name -> collect (name :: inputs)
+      | Token.Eq -> params
+      | Token.Id name -> collect (name :: params)
       | _ -> error "expected '=' or ident after let name"
     in
     let init =
       collect []
       |> List.fold_left
-           (fun expr input -> Ast.Abs (input, expr))
+           (fun body param -> Ast.Abs (param, body))
            (parse_expr parser)
     in
     consume parser Token.In "expected 'in' after let initializer";
     let expr = parse_expr parser in
-    Ast.Bind (name, init, expr)
+    Ast.Bind (is_recursive, name, init, expr)
 
   (* cond := 'if' expr 'then' expr 'else' expr ; *)
   and parse_cond parser =
@@ -415,27 +418,34 @@ module Runtime = struct
       | Unit
       | Int of int
       | Bool of bool
-      | Fun of (string * Ast.expr * t Env.t)
-      | Native of (string * (t -> t))
+      | Fun of (string * Ast.expr * t ref Env.t)
+      | Native of (t -> t)
+    (* | Patch (* placeholder for recursive bindings *) *)
 
-    let rec show = function
+    let show = function
       | Unit -> "()"
       | Int n -> string_of_int n
       | Bool b -> string_of_bool b
-      | Fun _ -> "<fn>"
-      | Native (name, _) -> format "<native fn '%s'>" name
+      | Fun _ | Native _ -> "<fn>"
 
-    let rec show_with_type v =
+    let show_with_type v =
       match v with
       | Unit -> format "unit = %s" (show v)
       | Int _ -> format "int = %s" (show v)
       | Bool _ -> format "bool = %s" (show v)
       | Fun (input, _, _) -> format "%s -> ? = %s" input (show v)
-      | Native (_, _) -> format "? -> ? = %s" (show v)
+      | Native _ -> format "? -> ? = %s" (show v)
+
+    let is_fn = function Fun _ -> true | _ -> false
   end
 
   open Ast
   open Value
+
+  let lookup env name =
+    match Env.find_opt name env with
+    | Some r -> !r
+    | None -> error (format "unbound var %s" name)
 
   let get_number_operands lhs rhs =
     match (lhs, rhs) with
@@ -454,10 +464,8 @@ module Runtime = struct
     | Lit Unit -> Unit
     | Lit (Int n) -> Int n
     | Lit (Bool b) -> Bool b
-    | Var name ->
-        Env.find_opt name env
-        |> Option.get_or_else (fun _ -> error (format "unbound var %s" name))
-    | Abs (input, expr) -> Fun (input, expr, env)
+    | Var name -> lookup env name
+    | Abs (param, body) -> Fun (param, body, env)
     | App (_ as app) -> eval_app env app
     | Bin (_ as bin) -> eval_bin env bin
     | Bind (_ as bind) -> eval_bind env bind
@@ -466,9 +474,24 @@ module Runtime = struct
   and eval_app env (lhs, rhs) =
     let lhs = eval' env lhs in
     let rhs = eval' env rhs in
+
+    (*
+
+    (\x. \y. x + y) 2 3
+
+    eval' {} app(app(abs(x, abs(y, bin(x, +, y))), 2), 3) ->
+      eval_app ->
+        lhs = eval' {} app(abs(x, abs(y, bin(x, +, y))), 2) ->
+          lhs = eval {} abs(x, abs(y, bin(x, +, y)))
+          rhs = 2
+          eval' { "x": 2 } abs(y, bin(x, +, y)) (now first lhs holds this fun with its env mapped) -> 
+        rhs = 3
+        eval { "x": 2, "y": 3 } bin(x, +, y) ->
+          2 + 3 (the env of the caller has never been modified)
+    *)
     match lhs with
-    | Native (_, f) -> f rhs
-    | Fun (input, expr, env') -> eval' (Env.add input rhs env') expr
+    | Native f -> f rhs
+    | Fun (param, body, env') -> eval' (Env.add param (ref rhs) env') body
     | _ -> error "only functions are callable"
 
   and eval_bin env (lhs, op, rhs) =
@@ -486,16 +509,23 @@ module Runtime = struct
     | Token.Slash -> bin_ari l ( / ) r
     | _ -> assert false
 
-  and eval_bind env (name, init, expr) =
-    let init = eval' env init in
-    eval' (Env.add name init env) expr
+  and eval_bind env (is_recursive, name, init, body) =
+    if not is_recursive then
+      let init = eval' env init in
+      eval' (Env.add name (ref init) env) body
+    else
+      let cell = ref Unit in
+      let env = Env.add name cell env in
+      (* todo: check if init is fn and is recursive *)
+      cell := eval' env init;
+      eval' env body
 
   and eval_cond env (cond, then_branch, else_branch) =
     match eval' env cond with
     | Bool b -> if b then eval' env then_branch else eval' env else_branch
     | _ -> error "only booleans are allowed in conditions"
 
-  let add_native name f = Env.add name (Native (name, f))
+  let add_native name f = Env.add name (ref (Native f))
 
   let init_env () =
     Env.empty
