@@ -66,6 +66,7 @@ module Token = struct
     | Or
     | If
     | Then
+    | Elif
     | Else
     | Let
     | Rec
@@ -81,6 +82,7 @@ module Token = struct
     | "or" -> Or
     | "if" -> If
     | "then" -> Then
+    | "elif" -> Elif
     | "else" -> Else
     | "let" -> Let
     | "rec" -> Rec
@@ -181,7 +183,7 @@ module Ast = struct
     | Abs of (string * expr)
     | App of (expr * expr)
     | Bind of (bool * string * expr * expr)
-    | Cond of (expr * expr * expr)
+    | Cond of ((expr * expr) list * expr)
     | Match of (expr * (pattern * expr) list)
   [@@deriving show { with_path = false }]
 
@@ -410,14 +412,22 @@ end = struct
     let expr = parse_expr parser in
     Ast.Bind (is_recursive, name, init, expr)
 
-  (* cond := 'if' expr 'then' expr 'else' expr ; *)
+  (* cond := 'if' expr 'then' expr ('elif' expr 'then' expr)* 'else' expr ; *)
   and parse_cond parser =
+    let first = parse_branch parser in
+    let rec loop branches =
+      if not @@ matches parser [ Token.Elif ] then List.rev branches
+      else loop (parse_branch parser :: branches)
+    in
+    let branches = loop [ first ] in
+    consume parser Token.Else "expected 'else' after 'then' body";
+    let else_branch = parse_expr parser in
+    Ast.Cond (branches, else_branch)
+
+  and parse_branch parser =
     let cond = parse_expr parser in
     consume parser Token.Then "expected 'then' after  condition";
-    let then_branch = parse_expr parser in
-    consume parser Token.Else "expected 'else' after 'then' expression";
-    let else_branch = parse_expr parser in
-    Ast.Cond (cond, then_branch, else_branch)
+    (cond, parse_expr parser)
 
   (* match := 'match' expr 'with' '|'? case ('|' case)* ; *)
   and parse_match parser =
@@ -451,10 +461,6 @@ end = struct
 end
 
 module Lower = struct
-  type x = Foo
-
-  let g = function Foo -> ()
-
   let rec lower expr = lower_match expr
 
   and lower_match = function
@@ -468,7 +474,12 @@ module Lower = struct
     | App (f, arg) -> App (lower_match f, lower_match arg)
     | Bind (is_rec, name, init, body) ->
         Bind (is_rec, name, lower_match init, lower_match body)
-    | Cond (c, t, e) -> Cond (lower_match c, lower_match t, lower_match e)
+    | Cond (branches, else_branch) ->
+        let branches =
+          branches
+          |> List.map @@ fun (cond, body) -> (lower_match cond, lower_match body)
+        in
+        Cond (branches, lower_match else_branch)
 
   (*
   let x = 0 in match x with 0 -> 100 | n -> n + 1
@@ -489,7 +500,7 @@ module Lower = struct
         | Lit lit_val ->
             let cond = Ast.Bin (scrutinee, Token.EqEq, Lit lit_val) in
             let else_branch = lower_cases scrutinee rest in
-            Cond (cond, body, else_branch))
+            Cond ([ (cond, body) ], else_branch))
 end
 
 module Runtime = struct
@@ -609,10 +620,17 @@ module Runtime = struct
       cell := eval' env init;
       eval' env body
 
-  and eval_cond env (cond, then_branch, else_branch) =
-    match eval' env cond with
-    | Bool b -> if b then eval' env then_branch else eval' env else_branch
-    | _ -> error "only booleans are allowed in conditions"
+  and eval_cond env (branches, else_branch) =
+    let branch =
+      branches
+      |> List.find_opt @@ fun (cond, _) ->
+         match eval' env cond with
+         | Bool b -> b
+         | _ -> error "only booleans are allowed in conditions"
+    in
+    match branch with
+    | Some (_, body) -> eval' env body
+    | None -> eval' env else_branch
 
   let add_native name f = Env.add name (ref (Native f))
 
