@@ -182,18 +182,19 @@ module Parser : sig
   val parse : string -> Ast.expr option
 end = struct
   (*
-    expr   := or ;
-    or     := and ('or' and)* ;
-    and    := eq ('and' eq)* ;
-    eq     := cmp (('==' | '!=') cmp)* ;
-    cmp    := term (('>' | '>=' | '<' | '<=') term)* ;
-    term   := factor (('+' | '-') factor)* ;
-    factor := app (('*' | '/') app)* ;
-    app    := atom atom* ;
-    atom   := ID | LIT | '(' expr ')' | abs | cond | bind ;
-    abs    := '\' ID '.' expr ;
-    cond   := 'if' expr 'then' expr else 'expr' ;
-    bind   := 'let' ID 'in' expr ;
+    expr    := or ;
+    or      := and ('or' and)* ;
+    and     := eq ('and' eq)* ;
+    eq      := cmp (('==' | '!=') cmp)* ;
+    cmp     := term (('>' | '>=' | '<' | '<=') term)* ;
+    term    := factor (('+' | '-') factor)* ;
+    factor  := (app | primary) (('*' | '/') (app | primary))* ;
+    app     := atom atom* ;
+    atom    := ID | LIT | '(' expr ')' | abs ;
+    abs     := '\' ID+ '.' expr ;
+    primary := atom | cond | bind ;
+    cond    := 'if' expr 'then' expr 'else' expr ;
+    bind    := 'let' ID '=' expr 'in' expr ;
   *)
 
   type t = {
@@ -328,7 +329,8 @@ end = struct
     let expr = parse_primary parser in
     let rec loop expr =
       match parser.current with
-      | Token.Id _ | Token.Num _ | Token.LParen | Token.Lam ->
+      | Token.Id _ | Token.Num _ | Token.True | Token.False | Token.LParen
+      | Token.Lam ->
           let rhs = parse_primary parser in
           loop (Ast.App (expr, rhs))
       | _ -> expr
@@ -354,11 +356,10 @@ end = struct
     | Token.If -> parse_cond parser
     | _ -> error "expected expression"
 
-  (** abs := '\' ID '.' expr ; *)
+  (** abs := '\' ID+ '.' expr ; *)
   and parse_abs parser =
     let input = consume_ident parser "expected ident after '\\'" in
-    (* nested abs syntax sugar -> \x y.x == \x.\y.x
-       abs := '\' ID+ '.' expr ; *)
+    (* nested abs syntax sugar -> \x y.x == \x.\y.x *)
     let rec loop input =
       advance parser;
       match parser.previous with
@@ -368,16 +369,31 @@ end = struct
     in
     loop input
 
-  (** bind := 'let' ID '=' expr 'in' expr *)
+  (* bind := 'let' ID+ '=' expr 'in' expr *)
   and parse_bind parser =
     let name = consume_ident parser "expected ident after 'let'" in
-    consume parser Token.Eq "expected '=' after let name";
-    let init = parse_expr parser in
+    (* sugar for binding abstractions:
+     let f a b = a + b in <expr>
+     let f = \a.\b.a + b in <expr>
+     - non-abstraction bindings remain the same: let x = 1 in <expr> *)
+    let rec collect inputs =
+      advance parser;
+      match parser.previous with
+      | Token.Eq -> inputs
+      | Token.Id name -> collect (name :: inputs)
+      | _ -> error "expected '=' or ident after let name"
+    in
+    let init =
+      collect []
+      |> List.fold_left
+           (fun expr input -> Ast.Abs (input, expr))
+           (parse_expr parser)
+    in
     consume parser Token.In "expected 'in' after let initializer";
     let expr = parse_expr parser in
     Ast.Bind (name, init, expr)
 
-  (* cond := 'if' expr 'then' expr else 'expr' ; *)
+  (* cond := 'if' expr 'then' expr 'else' expr ; *)
   and parse_cond parser =
     let cond = parse_expr parser in
     consume parser Token.Then "expected 'then' after  condition";
@@ -421,15 +437,18 @@ module Runtime = struct
   open Ast
   open Value
 
-  let bin_cmp lhs op rhs =
+  let get_number_operands lhs rhs =
     match (lhs, rhs) with
-    | Int l, Int r -> Bool (op l r)
+    | Int l, Int r -> (l, r)
     | _ -> error "operands must be numbers"
 
+  let bin_cmp lhs op rhs =
+    let l, r = get_number_operands lhs rhs in
+    Bool (op l r)
+
   let bin_ari lhs op rhs =
-    match (lhs, rhs) with
-    | Int l, Int r -> Int (op l r)
-    | _ -> error "operands must be numbers"
+    let l, r = get_number_operands lhs rhs in
+    Int (op l r)
 
   let rec eval' env = function
     | Lit Unit -> Unit
@@ -490,11 +509,18 @@ end
 type interpret_error = Parse_error of string | Runtime_error of string
 
 let interpret source =
-  try Ok (Parser.parse source |> Option.map Runtime.eval) with
+  try
+    Ok
+      (Parser.parse source
+      |> Option.map @@ fun expr ->
+         Ast.show_expr expr |> print_endline;
+         Runtime.eval expr)
+  with
   | Parser.Exn reason -> Error (Parse_error reason)
   | Runtime.Exn reason -> Error (Runtime_error reason)
 
 let rec run_repl () =
+  print_string "\x1b[34mλ>\x1b[0m ";
   try
     (match read_line () |> interpret with
     | Ok (Some value) -> Runtime.Value.show_with_type value |> println "- : %s"
