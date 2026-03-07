@@ -505,10 +505,42 @@ end
 module Lower = struct
   let rec lower expr = lower_match expr
 
+  (*
+  -- this is ok if the scrutinee is just a lit or var
+  let x = 0 in match x with 1 -> 100 | 2 -> 200 |  n -> n + 1
+
+  let x = 0 in
+    if x == 1 then 100
+    else
+      if n == 2 then 200
+      else
+        let n = x in
+        n + 1
+
+  -- but if the scrutinee is expensive to compute we end up with repeated computations
+  let f x = x + 1 in
+  match f 0 with 1 -> 100 | 2 -> 200 | n -> n + 1
+
+  let f x = x + 1 in
+  if f 0 == 1 then 100
+  else
+    if f 0 == 2 then 200
+    ...
+
+  -- the solution is to add a temporary variable with the scrutinee already computed
+  let f x = x + 1 in
+  let _tmp = f 0 in
+  if _tmp == 1 then 100
+  else
+    if _tmp == 2 then 200
+    ...
+ *)
   and lower_match = function
     | Ast.Match (scrutinee, cases) ->
         let scrutinee = lower_match scrutinee in
-        lower_cases scrutinee cases
+        let tmp = "_match_tmp" in
+        let body = lower_cases (Ast.Var tmp) cases in
+        Ast.Bind (false, tmp, scrutinee, body)
     | Lit _ as lit -> lit
     | Var _ as v -> v
     | Bin (l, op, r) -> Bin (lower_match l, op, lower_match r)
@@ -518,17 +550,6 @@ module Lower = struct
         Bind (is_rec, name, lower_match init, lower_match body)
     | Cond (c, t, e) -> Cond (lower_match c, lower_match t, lower_match e)
 
-  (*
-  let x = 0 in match x with 0 -> 100 | 1 -> 200 |  n -> n + 1
-
-  let x = 0 in
-    if x == 0 then 100
-    else
-      if n == 1 then 200
-      else
-        let n = x in
-           n + 1
- *)
   and lower_cases scrutinee = function
     | [] -> failwith "non-exhausitve match"
     | (pat, body) :: rest -> (
@@ -536,8 +557,8 @@ module Lower = struct
         match pat with
         | Wildcard -> body
         | Var name -> Bind (false, name, scrutinee, body)
-        | Lit lit_val ->
-            let cond = Ast.Bin (scrutinee, Token.EqEq, Lit lit_val) in
+        | Lit x ->
+            let cond = Ast.Bin (scrutinee, Token.EqEq, Lit x) in
             let else_branch = lower_cases scrutinee rest in
             Cond (cond, body, else_branch))
 end
@@ -680,24 +701,28 @@ type interpret_error = Parse_error of string | Runtime_error of string
 
 let interpret source =
   try
-    Ok
-      (Parser.parse source
-      |> Option.map @@ fun expr ->
-         Ast.show_expr expr |> println "before lower: %s";
-         let expr = Lower.lower expr in
-         Ast.show_expr expr |> println "after lower: %s";
-         Runtime.eval expr)
+    Parser.parse source
+    |> Option.map @@ fun expr ->
+       Ast.show_expr expr |> println "before lower: %s";
+       let expr = Lower.lower expr in
+       Ast.show_expr expr |> println "after lower: %s";
+       let start = Sys.time () in
+       let ret = Runtime.eval expr in
+       println "took: %fs" (Sys.time () -. start);
+       ret
   with
-  | Parser.Exn reason -> Error (Parse_error reason)
-  | Runtime.Exn reason -> Error (Runtime_error reason)
+  | Parser.Exn reason ->
+      eprintln "parse error: %s" reason;
+      None
+  | Runtime.Exn reason ->
+      eprintln "runtime error: %s" reason;
+      None
 
 let rec run_repl () =
   print_string "\x1b[34mλ>\x1b[0m ";
   try
     (match read_line () |> interpret with
-    | Ok (Some value) -> Runtime.Value.show_with_type value |> println "- : %s"
-    | Error (Parse_error reason) -> eprintln "parse error: %s" reason
-    | Error (Runtime_error reason) -> eprintln "runtime error: %s" reason
+    | Some value -> Runtime.Value.show_with_type value |> println "- : %s"
     | _ -> ());
     run_repl ()
   with End_of_file -> ()
@@ -714,9 +739,7 @@ let run_file path =
        exit 1
   in
   match interpret source with
-  | Ok (Some value) -> Runtime.Value.show value |> print_endline
-  | Error (Parse_error reason) -> eprintln "parse error: %s" reason
-  | Error (Runtime_error reason) -> eprintln "runtime error: %s" reason
+  | Some value -> Runtime.Value.show value |> print_endline
   | _ -> ()
 
 let () =
