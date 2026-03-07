@@ -200,7 +200,7 @@ module Ast = struct
     | Abs of (string * expr)
     | App of (expr * expr)
     | Bind of (bool * string * expr * expr)
-    | Cond of ((expr * expr) list * expr)
+    | Cond of (expr * expr * expr)
     | Match of (expr * (pattern * expr) list)
   [@@deriving show { with_path = false }]
 
@@ -223,9 +223,9 @@ end = struct
     cmp      := term (('>' | '>=' | '<' | '<=') term)* ;
     term     := factor (('+' | '-') factor)* ;
     factor   := operand (('*' | '/') operand)* ;
-    operand  := cond | bind | match | app ;
-    cond     := 'if' expr 'then' expr ('elif' expr 'then' expr)* 'else' expr ;
-    bind     := 'let' ID+ '=' expr 'in' expr ;
+    operand  :=  bind | cond | match | app ;
+    bind     := 'let' 'rec'? ID+ '=' expr 'in' expr ;
+    cond     := 'if' expr 'then' expr 'else' expr ;
     match    := 'match' expr 'with' '|'? case ('|' case)* ;
     case     := pattern '->' expr ;
     pattern  := pat_atom ('|' pat_atom)* ;
@@ -362,6 +362,7 @@ end = struct
     in
     loop expr
 
+  (* operand := bind | cond | match | app ; *)
   and parse_operand parser =
     match parser.current with
     | Token.Let ->
@@ -407,18 +408,14 @@ end = struct
     in
     loop [ parse_item parser ]
 
-  (* cond := 'if' expr 'then' expr ('elif' expr 'then' expr)* 'else' expr ; *)
+  (* cond := 'if' expr 'then' expr 'else' expr ; *)
   and parse_cond parser =
-    let first = parse_branch parser in
-    let rec loop branches =
-      if not @@ matches parser [ Token.Elif ] then List.rev branches
-      else loop (parse_branch parser :: branches)
-    in
-    let branches = loop [ first ] in
-    (* let branches = parse_collection_with_one parser Token.Elif parse_branch in *)
+    let cond = parse_expr parser in
+    consume parser Token.Then "expected 'then' after  condition";
+    let then_branch = parse_expr parser in
     consume parser Token.Else "expected 'else' after 'then' body";
     let else_branch = parse_expr parser in
-    Ast.Cond (branches, else_branch)
+    Ast.Cond (cond, then_branch, else_branch)
 
   and parse_branch parser =
     let cond = parse_expr parser in
@@ -445,6 +442,8 @@ end = struct
     let body = parse_expr parser in
     (pat, body)
 
+  (* pattern  := pat_atom ('|' pat_atom)* ; *)
+  (* pat_atom := '_' | ID | LIT ; *)
   and parse_pattern parser =
     advance parser;
     match parser.previous with
@@ -513,12 +512,7 @@ module Lower = struct
     | App (f, arg) -> App (lower_match f, lower_match arg)
     | Bind (is_rec, name, init, body) ->
         Bind (is_rec, name, lower_match init, lower_match body)
-    | Cond (branches, else_branch) ->
-        let branches =
-          branches
-          |> List.map @@ fun (cond, body) -> (lower_match cond, lower_match body)
-        in
-        Cond (branches, lower_match else_branch)
+    | Cond (c, t, e) -> Cond (lower_match c, lower_match t, lower_match e)
 
   (*
   let x = 0 in match x with 0 -> 100 | 1 -> 200 |  n -> n + 1
@@ -532,7 +526,7 @@ module Lower = struct
            n + 1
  *)
   and lower_cases scrutinee = function
-    | [] -> failwith "match failure at runtime"
+    | [] -> failwith "non-exhausitve match"
     | (pat, body) :: rest -> (
         let body = lower_match body in
         match pat with
@@ -541,7 +535,7 @@ module Lower = struct
         | Lit lit_val ->
             let cond = Ast.Bin (scrutinee, Token.EqEq, Lit lit_val) in
             let else_branch = lower_cases scrutinee rest in
-            Cond ([ (cond, body) ], else_branch))
+            Cond (cond, body, else_branch))
 end
 
 module Runtime = struct
@@ -661,17 +655,11 @@ module Runtime = struct
       cell := eval' env init;
       eval' env body
 
-  and eval_cond env (branches, else_branch) =
-    let branch =
-      branches
-      |> List.find_opt @@ fun (cond, _) ->
-         match eval' env cond with
-         | Bool b -> b
-         | _ -> error "only booleans are allowed in conditions"
-    in
-    match branch with
-    | Some (_, body) -> eval' env body
-    | None -> eval' env else_branch
+  and eval_cond env (cond, then_branch, else_branch) =
+    match eval' env cond with
+    | Bool true -> eval' env then_branch
+    | Bool false -> eval' env else_branch
+    | _ -> error "only booleans are allowed in conditions"
 
   let add_native name f = Env.add name (ref (Native f))
 
