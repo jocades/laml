@@ -106,6 +106,10 @@ end = struct
     if lexer.cursor >= String.length lexer.source then None
     else Some lexer.source.[lexer.cursor]
 
+  let peek_next lexer =
+    if lexer.cursor + 1 >= String.length lexer.source then None
+    else Some lexer.source.[lexer.cursor + 1]
+
   let advance lexer =
     peek lexer
     |> Option.map @@ fun c ->
@@ -125,6 +129,19 @@ end = struct
       let _ = advance lexer in
       true
     else false
+
+  let skip_whitespace lexer =
+    let rec loop () =
+      match peek lexer with
+      | Some c when Char.is_whitespace c ->
+          seek lexer Char.is_whitespace;
+          loop ()
+      | Some c when c = '/' && peek_next lexer = Some '/' ->
+          seek lexer (( <> ) '\n');
+          loop ()
+      | _ -> ()
+    in
+    loop ()
 
   let next_token lexer =
     let open Token in
@@ -199,19 +216,23 @@ module Parser : sig
   val parse : string -> Ast.expr option
 end = struct
   (*
-    expr    := or ;
-    or      := and ('or' and)* ;
-    and     := eq ('and' eq)* ;
-    eq      := cmp (('==' | '!=') cmp)* ;
-    cmp     := term (('>' | '>=' | '<' | '<=') term)* ;
-    term    := factor (('+' | '-') factor)* ;
-    factor  := (app | primary) (('*' | '/') (app | primary))* ;
-    app     := atom atom* ;
-    atom    := ID | LIT | '(' expr ')' | abs ;
-    abs     := '\' ID+ '.' expr ;
-    primary := atom | cond | bind ;
-    cond    := 'if' expr 'then' expr 'else' expr ;
-    bind    := 'let' ID+ '=' expr 'in' expr ;
+    expr     := or ;
+    or       := and ('or' and)* ;
+    and      := eq ('and' eq)* ;
+    eq       := cmp (('==' | '!=') cmp)* ;
+    cmp      := term (('>' | '>=' | '<' | '<=') term)* ;
+    term     := factor (('+' | '-') factor)* ;
+    factor   := operand (('*' | '/') operand)* ;
+    operand  := cond | bind | match | app ;
+    cond     := 'if' expr 'then' expr ('elif' expr 'then' expr)* 'else' expr ;
+    bind     := 'let' ID+ '=' expr 'in' expr ;
+    match    := 'match' expr 'with' '|'? case ('|' case)* ;
+    case     := pattern '->' expr ;
+    pattern  := pat_atom ('|' pat_atom)* ;
+    pat_atom := '_' | ID | LIT ;
+    app      := atom atom* ;
+    atom     := ID | LIT | '(' expr ')' | abs ;
+    abs      := '\' ID+ '.' expr ;
   *)
 
   type t = {
@@ -329,63 +350,30 @@ end = struct
 
   (** factor := app (('*' | '/') app)* ; *)
   and parse_factor parser =
-    let expr = parse_app parser in
+    let expr = parse_operand parser in
     let rec loop expr =
       match parser.current with
       | Token.Star | Token.Slash ->
           advance parser;
           let op = parser.previous in
-          let rhs = parse_app parser in
+          let rhs = parse_operand parser in
           loop (Ast.Bin (expr, op, rhs))
       | _ -> expr
     in
     loop expr
 
-  (** app := atom atom* ; *)
-  and parse_app parser =
-    let expr = parse_primary parser in
-    let rec loop expr =
-      match parser.current with
-      | Token.Id _ | Token.Num _ | Token.True | Token.False | Token.LParen
-      | Token.Lam ->
-          let rhs = parse_primary parser in
-          loop (Ast.App (expr, rhs))
-      | _ -> expr
-    in
-    loop expr
-
-  (** atom := ID | LIT | '(' expr ')' | abs ; *)
-  and parse_primary parser =
-    advance parser;
-    match parser.previous with
-    | Token.Id name -> Ast.Var name
-    | Token.Num x -> Ast.Lit (Int (int_of_string x))
-    | Token.True -> Ast.Lit (Bool true)
-    | Token.False -> Ast.Lit (Bool false)
-    | Token.LParen ->
-        if matches parser [ Token.RParen ] then Ast.Lit Unit
-        else
-          let expr = parse_expr parser in
-          consume parser Token.RParen "expected ')' after grouping";
-          expr
-    | Token.Lam -> parse_abs parser
-    | Token.Let -> parse_bind parser
-    | Token.If -> parse_cond parser
-    | Token.Match -> parse_match parser
-    | _ -> error "expected expression"
-
-  (** abs := '\' ID+ '.' expr ; *)
-  and parse_abs parser =
-    let param = consume_ident parser "expected ident after '\\'" in
-    (* nested abs syntax sugar -> \x y.x == \x.\y.x *)
-    let rec loop param =
-      advance parser;
-      match parser.previous with
-      | Token.Dot -> Ast.Abs (param, parse_expr parser)
-      | Token.Id name -> Ast.Abs (param, loop name)
-      | _ -> error "expected '.' or ident"
-    in
-    loop param
+  and parse_operand parser =
+    match parser.current with
+    | Token.Let ->
+        advance parser;
+        parse_bind parser
+    | Token.If ->
+        advance parser;
+        parse_cond parser
+    | Token.Match ->
+        advance parser;
+        parse_match parser
+    | _ -> parse_app parser
 
   (* bind := 'let' 'rec'? ID+ '=' expr 'in' expr *)
   and parse_bind parser =
@@ -409,8 +397,15 @@ end = struct
            (parse_expr parser)
     in
     consume parser Token.In "expected 'in' after let initializer";
-    let expr = parse_expr parser in
-    Ast.Bind (is_recursive, name, init, expr)
+    let body = parse_expr parser in
+    Ast.Bind (is_recursive, name, init, body)
+
+  and parse_collection_with_one parser sep parse_item =
+    let rec loop acc =
+      if not @@ matches parser [ sep ] then List.rev acc
+      else loop (parse_item parser :: acc)
+    in
+    loop [ parse_item parser ]
 
   (* cond := 'if' expr 'then' expr ('elif' expr 'then' expr)* 'else' expr ; *)
   and parse_cond parser =
@@ -420,6 +415,7 @@ end = struct
       else loop (parse_branch parser :: branches)
     in
     let branches = loop [ first ] in
+    (* let branches = parse_collection_with_one parser Token.Elif parse_branch in *)
     consume parser Token.Else "expected 'else' after 'then' body";
     let else_branch = parse_expr parser in
     Ast.Cond (branches, else_branch)
@@ -434,15 +430,15 @@ end = struct
     let scrutinee = parse_expr parser in
     consume parser Token.With "expected 'with' after match scrutinee";
     if parser.current = Token.Pipe then advance parser;
-    let first = parse_case parser in
-    let rec cases acc =
-      match parser.current with
-      | Token.Pipe -> cases (parse_case parser :: acc)
-      | _ -> List.rev acc
-    in
-    Ast.Match (scrutinee, cases [ first ])
+    let cases = parse_collection_with_one parser Token.Pipe parse_case in
+    (* let first = parse_case parser in *)
+    (* let rec cases acc = *)
+    (*   if not @@ matches parser [ Token.Pipe ] then List.rev acc *)
+    (*   else cases (parse_case parser :: acc) *)
+    (* in *)
+    Ast.Match (scrutinee, cases)
 
-  (* case := pattern '->' expr *)
+  (* case := pattern '->' expr ; *)
   and parse_case parser =
     let pat = parse_pattern parser in
     consume parser Token.Arrow "expected '->' after pattern";
@@ -458,6 +454,49 @@ end = struct
     | Token.True -> Ast.Lit (Bool true)
     | Token.False -> Ast.Lit (Bool false)
     | _ -> error "expected pattern"
+
+  (** app := atom atom* ; *)
+  and parse_app parser =
+    let expr = parse_atom parser in
+    let rec loop expr =
+      match parser.current with
+      | Token.Id _ | Token.Num _ | Token.True | Token.False | Token.LParen
+      | Token.Lam ->
+          let rhs = parse_atom parser in
+          loop (Ast.App (expr, rhs))
+      | _ -> expr
+    in
+    loop expr
+
+  (** atom := ID | LIT | '(' expr ')' | abs ; *)
+  and parse_atom parser =
+    advance parser;
+    match parser.previous with
+    | Token.Id name -> Ast.Var name
+    | Token.Num x -> Ast.Lit (Int (int_of_string x))
+    | Token.True -> Ast.Lit (Bool true)
+    | Token.False -> Ast.Lit (Bool false)
+    | Token.LParen ->
+        if matches parser [ Token.RParen ] then Ast.Lit Unit
+        else
+          let expr = parse_expr parser in
+          consume parser Token.RParen "expected ')' after grouping";
+          expr
+    | Token.Lam -> parse_abs parser
+    | _ -> error "expected expression"
+
+  (** abs := '\' ID+ '.' expr ; *)
+  and parse_abs parser =
+    let param = consume_ident parser "expected ident after '\\'" in
+    (* nested abs syntax sugar -> \x y.x == \x.\y.x *)
+    let rec loop param =
+      advance parser;
+      match parser.previous with
+      | Token.Dot -> Ast.Abs (param, parse_expr parser)
+      | Token.Id name -> Ast.Abs (param, loop name)
+      | _ -> error "expected '.' or ident"
+    in
+    loop param
 end
 
 module Lower = struct
@@ -482,13 +521,15 @@ module Lower = struct
         Cond (branches, lower_match else_branch)
 
   (*
-  let x = 0 in match x with 0 -> 100 | n -> n + 1
+  let x = 0 in match x with 0 -> 100 | 1 -> 200 |  n -> n + 1
 
   let x = 0 in
     if x == 0 then 100
     else
-      let n = x in
-        n + 1
+      if n == 1 then 200
+      else
+        let n = x in
+           n + 1
  *)
   and lower_cases scrutinee = function
     | [] -> failwith "match failure at runtime"

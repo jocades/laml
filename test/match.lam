@@ -1,0 +1,5 @@
+let f x = x + 1 in
+  match f 0 with
+    | 1 -> 100
+    | 2 -> 200
+    | n -> n * 2
