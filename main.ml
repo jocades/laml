@@ -136,16 +136,27 @@ end = struct
       | Some c when Char.is_whitespace c ->
           seek lexer Char.is_whitespace;
           loop ()
-      | Some c when c = '/' && peek_next lexer = Some '/' ->
+      | Some '/' when peek_next lexer = Some '/' ->
           seek lexer (( <> ) '\n');
+          let _ = advance lexer in
           loop ()
       | _ -> ()
     in
     loop ()
 
+  let read_ident lexer =
+    let start = lexer.cursor - 1 in
+    seek lexer (fun c -> c = '_' || Char.is_alnum c);
+    String.sub lexer.source start (lexer.cursor - start) |> Token.lookup_ident
+
+  let read_number lexer =
+    let start = lexer.cursor - 1 in
+    seek lexer Char.is_digit;
+    Token.Num (String.sub lexer.source start (lexer.cursor - start))
+
   let next_token lexer =
     let open Token in
-    seek lexer Char.is_whitespace;
+    skip_whitespace lexer;
     advance lexer
     |> Option.map @@ function
        (* delims *)
@@ -165,15 +176,8 @@ end = struct
        | '<' -> if matches lexer '=' then LtEq else Lt
        | '|' -> Pipe
        (* items *)
-       | c when c = '_' || Char.is_alpha c ->
-           let start = lexer.cursor - 1 in
-           seek lexer (fun c -> c = '_' || Char.is_alnum c);
-           String.sub lexer.source start (lexer.cursor - start)
-           |> Token.lookup_ident
-       | c when Char.is_digit c ->
-           let start = lexer.cursor - 1 in
-           seek lexer Char.is_digit;
-           Num (String.sub lexer.source start (lexer.cursor - start))
+       | c when Char.is_digit c -> read_number lexer
+       | c when c = '_' || Char.is_alpha c -> read_ident lexer
        | c -> failwith (format "unexpected character '%c'" c)
 
   let debug_tokens source =
